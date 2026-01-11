@@ -2,6 +2,7 @@
   <h1 align="center">
     Continual Test-Time Adaptation for Remote Sensing Object Detection
   </h1>
+  
   <p align="center">
       Derrick<sup></sup>&emsp;
       <!-- 可后续补充作者 -->
@@ -26,8 +27,9 @@ Official PyTorch implementation of
 **Continual Test-Time Adaptation for Remote Sensing Object Detection**
 
 <div align="center">
-  <!-- <img src="assets/overview.png" width="100%"/> -->
+  <img src="overview.jpg" width="100%"/>
 </div>
+
 
 ---
 
