@@ -23,8 +23,7 @@
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 -->
 
-Official PyTorch implementation of  
-**Continual Test-Time Adaptation for Remote Sensing Object Detection**
+Official PyTorch implementation of  **Continual Test-Time Adaptation for Remote Sensing Object Detection**
 
 <div align="center">
   <img src="overview.jpg" width="100%"/>
