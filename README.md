@@ -32,14 +32,6 @@ Official PyTorch implementation of  **Continual Test-Time Adaptation for Remote 
 
 ---
 
-## 🔔 Notice
-This repository is under active development and organization.  
-More code, checkpoints, and instructions will be released soon.
-
-If you encounter any issues, feel free to open an issue.
-
----
-
 ## ✅ TODO
 - [x] Initialize repository structure
 - [ ] Release paper link
