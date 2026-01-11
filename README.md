@@ -43,15 +43,6 @@ Official PyTorch implementation of  **Continual Test-Time Adaptation for Remote 
 
 Remote sensing object detection (RSOD) plays a crucial role in applications such as urban planning, disaster response, and environmental monitoring. Despite advances in generic object detection, RSOD remains challenging due to complex variations across sensors, geographic regions, illumination, weather, and object scales, which induce severe domain shifts when models trained on source domains are deployed on unseen target domains. Test-time adaptation (TTA) offers a practical solution by enabling online model adaptation using only incoming test data, but conventional TTA methods generally assume relatively static target distributions, limiting their effectiveness under the dynamic and diverse conditions of RSOD. Continual test-time adaptation for object detection (CTAOD) extends TTA to sequentially arriving test samples, yet existing approaches often rely on global feature updates with fixed thresholds, leading to noisy feature propagation, error accumulation, and catastrophic forgetting. In this paper, we propose CTAOD-RS, a novel framework for continual test-time adaptive object detection in remote sensing imagery. CTAOD-RS leverages Spectral Routing to decompose features into frequency and spatial components, suppressing noise and clutter, and employs Historical Reconstruction to dynamically determine when model adaptation is necessary, avoiding unnecessary updates and mitigating catastrophic forgetting. Extensive experiments on benchmark RSOD datasets demonstrate that CTAOD-RS achieves superior detection accuracy and robustness compared to existing TTA and CTAOD methods, while maintaining high efficiency.
 
----
-
-## 📄 Paper
-
-**Title:** Continual Test-Time Adaptation for Remote Sensing Object Detection  
-**Authors:** Derrick et al.  
-**Status:** Under review  
-
-
 
 ---
 
