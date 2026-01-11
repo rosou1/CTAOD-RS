@@ -97,3 +97,11 @@ pip install torch torchvision torchaudio
 # Install other dependencies
 pip install -r requirements.txt
 
+## 📂 Dataset Preparation
+
+
+- Download the DIOR-C at the |[Baidu Cloud](https://pan.baidu.com/s/1WGoVqLuJTJXc2AVDyBxXYQ?pwd=s6rk)|
+
+## 📝 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
