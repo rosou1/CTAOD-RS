@@ -41,11 +41,8 @@ If you encounter any issues, feel free to open an issue.
 
 ## ✅ TODO
 - [x] Initialize repository structure
-- [ ] Complete training and evaluation scripts
 - [ ] Release paper link
 - [ ] Release pretrained checkpoints
-- [ ] Add demo and visualization
-- [ ] Bug fixes and code cleanup
 
 ---
 
@@ -70,7 +67,7 @@ online adaptation under long-term domain shift in remote sensing imagery.
 **Authors:** Derrick et al.  
 **Status:** Under review  
 
-📌 Paper link: *coming soon*
+
 
 ---
 
