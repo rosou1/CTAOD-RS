@@ -79,9 +79,9 @@ pip install -r requirements.txt
 ---
 ## 📝 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+- This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 ---
 ## 🙌 Acknowledgments
 
-Our work is inspired by WHW(https://github.com/natureyoo/ContinualTTA_ObjectDetection) and Earth-Adapter(https://github.com/VisionXLab/Earth-Adapter). We are grateful for their outstanding work and code.
+- Our work is inspired by WHW(https://github.com/natureyoo/ContinualTTA_ObjectDetection) and Earth-Adapter(https://github.com/VisionXLab/Earth-Adapter). We are grateful for their outstanding work and code.
 ---
