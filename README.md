@@ -71,7 +71,7 @@ pip install torch torchvision torchaudio
 
 # Install other dependencies
 pip install -r requirements.txt
-
+```
 ---
 ## 📂 Dataset Preparation
 
