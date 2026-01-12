@@ -84,3 +84,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 🙌 Acknowledgments
 
 Our work is inspired by WHW(https://github.com/natureyoo/ContinualTTA_ObjectDetection) and Earth-Adapter(https://github.com/VisionXLab/Earth-Adapter). We are grateful for their outstanding work and code.
+---
