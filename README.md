@@ -72,15 +72,15 @@ pip install torch torchvision torchaudio
 # Install other dependencies
 pip install -r requirements.txt
 
+---
 ## 📂 Dataset Preparation
 
-
 - Download the DIOR-C at the |[Baidu Cloud](https://pan.baidu.com/s/1WGoVqLuJTJXc2AVDyBxXYQ?pwd=s6rk)|
-
+---
 ## 📝 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
+---
 ## 🙌 Acknowledgments
 
 Our work is inspired by WHW(https://github.com/natureyoo/ContinualTTA_ObjectDetection) and Earth-Adapter(https://github.com/VisionXLab/Earth-Adapter). We are grateful for their outstanding work and code.
