@@ -76,7 +76,7 @@ pip install -r requirements.txt
 ## 📂 Dataset Preparation
 
 - Download the DIOR-C at the |[Baidu Cloud](https://pan.baidu.com/s/1g01ATN473z3kfr73w88R-A?pwd=rwvf)|
-- Download the source features statistics of DIOR at the |[Baidu Cloud](https://pan.baidu.com/s/1t_qRuLr4reb3Qj9Tp6TxIQ?pwd=i5jt)|
+- Download the source features statistics of DIOR at the |[Baidu Cloud](https://pan.baidu.com/s/1pMDURPX_tfUDo1G-T8xLsw?pwd=sv8n)|
 ---
 ## 📝 License
 
