@@ -1,0 +1,52 @@
+_BASE_: "../Base/COCO_faster_rcnn_R50_FPN_1x.yaml"
+MODEL:
+  # WEIGHTS: "./models/faster_rcnn_r50_coco.pth"
+  WEIGHTS: "./outputs/r50_weights/model_final.pth"
+  MASK_ON: false  
+  RESNETS:
+    DEPTH: 50  
+  ROI_HEADS:
+    NUM_CLASSES: 20  
+    SCORE_THRESH_TEST: 0.5 
+  ANCHOR_GENERATOR:
+    SIZES: [[16, 32, 64, 128, 256]]  
+    ASPECT_RATIOS: [[0.5, 1.0, 2.0, 3.0]]  
+SOLVER:
+  IMS_PER_BATCH_TEST: 4
+  BASE_LR: 0.0025
+  CLIP_GRADIENTS:
+    ENABLED: True
+    CLIP_VALUE: 5.0 
+INPUT:
+  MIN_SIZE_TRAIN: [640, 800, 1024]  
+  MAX_SIZE_TRAIN: 1600  
+  MIN_SIZE_TEST: 800  
+  FORMAT: "BGR"  
+TEST:
+  ONLINE_ADAPTATION: True
+  CONTINUAL_DOMAIN: True
+# VISUALIZATION:
+#     ENABLED = True
+#     SAVE_TOP_K = 10
+#     SCORE_THRESHOLD = 0.5
+  ADAPTATION:
+    CONTINUAL: True
+    # SOURCE_FEATS_PATH: "./models/COCO_R50_stats.pt"
+    SOURCE_FEATS_PATH: "./outputs/feature/r50featurestats.pt"
+    GLOBAL_ALIGN: "KL"
+    FOREGROUND_ALIGN: "KL"
+    ALPHA_GLOBAL: 0.1
+    ALPHA_FOREGROUND: 0.1
+    WEIGHT_REG: 0.0
+    TH_BG: 0.5
+    EMA_GAMMA: 128
+    FREQ_WEIGHT: True
+    USE_RD: True
+    RD_DIM: 64
+    RD_BUFFER_SIZE: 1000
+  ADAPTER:
+    TYPE: "spectral"
+    SPECTRAL_ADAPTER:
+      FFT_BLOCKS: [2,6,12,15]
+
+

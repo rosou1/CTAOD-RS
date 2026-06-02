@@ -1,0 +1,39 @@
+_BASE_: "../Base/COCO_faster_rcnn_swinT_FPN_1x.yaml"
+MODEL:
+  WEIGHTS: "./outputs/swt_weights/model_final.pth"
+INPUT:
+  MIN_SIZE_TRAIN: [640, 800, 1024]  
+  MAX_SIZE_TRAIN: 1600  
+  MIN_SIZE_TEST: 800  
+  FORMAT: "BGR" 
+SOLVER:
+  TYPE: "SGD"
+  IMS_PER_BATCH_TEST: 4
+  BASE_LR: 0.001
+  CLIP_GRADIENTS:
+    ENABLED: True
+    CLIP_VALUE: 5.0
+TEST:
+  ONLINE_ADAPTATION: True
+  CONTINUAL_DOMAIN: True
+  ADAPTATION:
+    CONTINUAL: True
+    SOURCE_FEATS_PATH: "./outputs/feature/swtfeaturestats.pt"
+    GLOBAL_ALIGN: "KL"
+    FOREGROUND_ALIGN: "KL"
+    ALPHA_GLOBAL: 1.0
+    ALPHA_FOREGROUND: 1.0
+    WEIGHT_REG: 0.0
+    TH_BG: 0.5
+    EMA_GAMMA: 128
+    FREQ_WEIGHT: True
+    USE_RD: False
+  ADAPTER:
+    TYPE: "spectral"
+    SPECTRAL_ADAPTER:
+      FFT_BLOCKS: [1,3,9,11]
+      WITH_TOKEN: False
+      TOKEN_DIM: 0
+      CUTOFF_RATIO: 0.3
+      SCALE: 0.1
+

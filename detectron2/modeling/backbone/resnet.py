@@ -1,0 +1,1208 @@
+# Copyright (c) Facebook, Inc. and its affiliates.
+import numpy as np
+import math
+import fvcore.nn.weight_init as weight_init
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch import Tensor
+from detectron2.config import CfgNode as CN
+
+from detectron2.layers import (
+    CNNBlockBase,
+    Conv2d,
+    DeformConv,
+    ModulatedDeformConv,
+    ShapeSpec,
+    get_norm,
+)
+
+from .backbone import Backbone
+from .build import BACKBONE_REGISTRY
+
+__all__ = [
+    "ResNetBlockBase",
+    "BasicBlock",
+    "BottleneckBlock",
+    "DeformBottleneckBlock",
+    "BasicStem",
+    "ResNet",
+    "make_stage",
+    "build_resnet_backbone",
+]
+
+
+def conv(in_planes, out_planes, kernel=3, stride=1, padding=1, bias=False):
+    return nn.Conv2d(in_planes, out_planes, kernel_size=kernel, stride=stride, padding=padding, bias=bias)
+
+
+def conv1x1_fonc(in_planes, out_planes=None, stride=1, bias=False):
+    if out_planes is None:
+        return nn.Conv2d(in_planes, in_planes, kernel_size=1, stride=stride, padding=0, bias=bias)
+    else:
+        return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, padding=0, bias=bias)
+
+
+class conv1x1(nn.Module):
+
+    def __init__(self, planes, out_planes=None, stride=1, mode="parallel", bias=False):
+        super(conv1x1, self).__init__()
+        self.mode = mode
+        if mode == 'series':
+            self.conv = nn.Sequential(nn.BatchNorm2d(planes), conv1x1_fonc(planes))
+        elif mode == 'parallel':
+            self.conv = conv1x1_fonc(planes, out_planes, stride, bias=bias)
+        else:
+            self.conv = conv1x1_fonc(planes)
+
+    def forward(self, x):
+        y = self.conv(x)
+        if self.mode == 'series_adapters':
+            y += x
+        return y
+
+
+class SSF(nn.Module):
+    '''
+        Multilayer Perceptron.
+    '''
+    def __init__(self, dim):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(dim))
+        self.shift = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x):
+        '''Forward pass'''
+        return x * self.scale + self.shift
+
+class SpectralAdapter(nn.Module):
+    def __init__(self, 
+                 in_planes, 
+                 planes, 
+                 r=32, 
+                 layer_idx=0,
+                 fft_blocks=None,
+                 cutoff_ratio=0.3,
+                 scalar_type=None,
+                 dropout=0.0,
+                 mode= "parallel"
+                ):
+        super(SpectralAdapter, self).__init__()
+        self.layer_idx = layer_idx
+        self.in_planes = in_planes
+        self.planes = planes
+        self.r = r
+        self.fft_blocks = fft_blocks if fft_blocks is not None else []
+        self.cutoff_ratio = cutoff_ratio
+        self.scalar_type = scalar_type
+        self.dropout = dropout
+        
+        self.mean_feats = torch.zeros((1, in_planes))
+        
+        # 初始化标量参�?- 与Swin保持一�?        self.scalar = nn.Parameter(torch.ones(1)) if scalar_type == 'learnable_scalar' else torch.ones(1)
+        
+        # 根据layer_idx决定是否启用FFT功能
+        if layer_idx in self.fft_blocks:
+            # 启用FFT的三分支结构
+            # 分支1: 原始特征适配�?            self.down_proj_1 = conv1x1(in_planes, in_planes // r, 1, mode=mode, bias=True)
+            self.non_linear_func_1 = nn.ReLU()
+            self.up_proj_1 = conv1x1(in_planes // r, planes, 1, mode=mode, bias=True)
+            
+            # 分支2: 低频特征适配�? 
+            self.down_proj_2 = conv1x1(in_planes, in_planes // r, 1, mode=mode, bias=True)
+            self.non_linear_func_2 = nn.ReLU()
+            self.up_proj_2 = conv1x1(in_planes // r, planes, 1, mode=mode, bias=True)
+            
+            # 分支3: 高频特征适配�?            self.down_proj_3 = conv1x1(in_planes, in_planes // r, 1, mode=mode, bias=True)
+            self.non_linear_func_3 = nn.ReLU()
+            self.up_proj_3 = conv1x1(in_planes // r, planes, 1, mode=mode, bias=True)
+            
+            # 路由网络
+            self.router = nn.Sequential(
+                nn.AdaptiveMaxPool2d(1),
+                nn.Flatten(),
+                nn.Linear(in_planes, 3)
+            )
+            
+            # 使用kaiming_uniform初始�?            with torch.no_grad():
+                nn.init.kaiming_uniform_(self.down_proj_1.conv.weight, a=math.sqrt(5))
+                nn.init.zeros_(self.up_proj_1.conv.weight)
+                nn.init.zeros_(self.down_proj_1.conv.bias)
+                nn.init.zeros_(self.up_proj_1.conv.bias)
+
+                nn.init.kaiming_uniform_(self.down_proj_2.conv.weight, a=math.sqrt(5))
+                nn.init.zeros_(self.up_proj_2.conv.weight)
+                nn.init.zeros_(self.down_proj_2.conv.bias)
+                nn.init.zeros_(self.up_proj_2.conv.bias)
+
+                nn.init.kaiming_uniform_(self.down_proj_3.conv.weight, a=math.sqrt(5))
+                nn.init.zeros_(self.up_proj_3.conv.weight)
+                nn.init.zeros_(self.down_proj_3.conv.bias)
+                nn.init.zeros_(self.up_proj_3.conv.bias)
+
+                # nn.init.kaiming_uniform_(self.router[2].weight, a=math.sqrt(5))
+#         else:
+#             # 不启用FFT的单分支结构 - 与原有Adapter结构类似但保持EarthAdapter的初始化方式
+#             self.down_proj = nn.Conv2d(in_planes, in_planes // r, kernel_size=1, bias=True)
+#             self.non_linear_func = nn.ReLU()
+#             self.up_proj = nn.Conv2d(in_planes // r, planes, kernel_size=1, bias=True)
+            
+#             # 使用kaiming_uniform初始�?#             with torch.no_grad():
+#                 nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
+#                 nn.init.kaiming_uniform_(self.up_proj.weight, a=math.sqrt(5))
+
+    def decompose_fft(self, feats: Tensor) -> Tensor:
+        """FFT频域分解 - 与Swin完全相同的逻辑"""
+        assert feats.dim() == 4, f"期望形状 (B, C, H, W)，但得到 {feats.shape}"
+
+        # FFT变换与频域移�?        fft = torch.fft.fft2(feats, norm='ortho')
+        fft_shifted = torch.fft.fftshift(fft, dim=(-2, -1))
+
+        # 计算高低频掩�?        batch_size, channels, H_feat, W_feat = fft_shifted.shape
+        cutoff = int(min(H_feat, W_feat) * self.cutoff_ratio // 2)
+        cx, cy = H_feat // 2, W_feat // 2
+        mask_low = torch.zeros_like(fft_shifted)
+        mask_low[:, :, cx - cutoff:cx + cutoff, cy - cutoff:cy + cutoff] = 1
+        mask_high = 1 - mask_low
+
+        # 分离高低�?        fft_low = fft_shifted * mask_low
+        fft_high = fft_shifted * mask_high
+        feats_low = torch.fft.ifft2(torch.fft.ifftshift(fft_low, dim=(-2, -1)), norm='ortho').real
+        feats_high = torch.fft.ifft2(torch.fft.ifftshift(fft_high, dim=(-2, -1)), norm='ortho').real
+        
+        return feats_low, feats_high
+
+    def forward(self, x):
+        if self.layer_idx in self.fft_blocks:
+            # FFT三分支路�?            # 分支1: 原始特征
+            delta_feat1 = self.down_proj_1(x)
+            delta_feat1 = self.non_linear_func_1(delta_feat1)
+            # delta_feat1 = nn.functional.dropout(delta_feat1, p=self.dropout, training=self.training)
+            delta_feat1 = self.up_proj_1(delta_feat1)
+            
+            # 分支2�?: FFT分解
+            low_freq, high_freq = self.decompose_fft(x)
+            
+            delta_feat2 = self.down_proj_2(low_freq)
+            delta_feat2 = self.non_linear_func_2(delta_feat2)
+            # delta_feat2 = nn.functional.dropout(delta_feat2, p=self.dropout, training=self.training)
+            delta_feat2 = self.up_proj_2(delta_feat2)
+            
+            delta_feat3 = self.down_proj_3(high_freq)
+            delta_feat3 = self.non_linear_func_3(delta_feat3)
+            # delta_feat3 = nn.functional.dropout(delta_feat3, p=self.dropout, training=self.training)
+            delta_feat3 = self.up_proj_3(delta_feat3)
+            
+            # 路由融合
+            router_weights = self.router(x)
+            router_weights = torch.softmax(router_weights, dim=-1)
+            
+            up = (router_weights[:, 0:1].view(-1, 1, 1, 1) * delta_feat1 +
+                  router_weights[:, 1:2].view(-1, 1, 1, 1) * delta_feat2 +
+                  router_weights[:, 2:3].view(-1, 1, 1, 1) * delta_feat3)
+        else:
+            # 单分支路�?            down = self.down_proj(x)
+            down = self.non_linear_func(down)
+            # down = nn.functional.dropout(down, p=self.dropout, training=self.training)
+            up = self.up_proj(down)
+
+
+        up = up * self.scalar.to(up.device)
+
+        return up
+
+# class SpectralAdapter(nn.Module):
+#     def __init__(self, 
+#                  in_planes, 
+#                  planes, 
+#                  r=32, 
+#                  layer_idx=0,
+#                  fft_blocks=None,
+#                  cutoff_ratio=0.3,
+#                  scalar_type=None,
+#                  dropout=0.0,
+#                  mode="parallel",
+#                  fft_down=2   # <<< 新增：FFT 降采样倍数
+#                  ):
+#         super().__init__()
+#         self.layer_idx = layer_idx
+#         self.in_planes = in_planes
+#         self.planes = planes
+#         self.r = r
+#         self.fft_blocks = fft_blocks if fft_blocks is not None else []
+#         self.cutoff_ratio = cutoff_ratio
+#         self.scalar_type = scalar_type
+#         self.dropout = dropout
+#         self.fft_down = fft_down  # 默认 2× 降采�?FFT
+
+#         self.scalar = nn.Parameter(torch.ones(1)) if scalar_type == "learnable_scalar" else torch.ones(1)
+
+#         if layer_idx in self.fft_blocks:
+#             # ------- faster three-branch -------
+#             mid = in_planes // r
+#             # 注意：这里的 in_channels 要匹�?merged 的通道�?(x + low + high) -> 3 * in_planes
+#             self.down = conv1x1(in_planes * 3, mid * 3, 1, mode=mode, bias=True)   # <<< 修复�?#             self.nonlin = nn.ReLU()
+#             self.up = conv1x1(mid * 3, planes * 3, 1, mode=mode, bias=True)
+
+#             # --- router: mean pool (much faster) ---
+#             self.router = nn.Sequential(
+#                 nn.Linear(in_planes, 3)
+#             )
+
+#             # mask buffer（初始化为空，第一�?forward 时建立）
+#             self.register_buffer("mask_low", None)
+#             self.register_buffer("mask_high", None)
+
+#         else:
+#             mid = in_planes // r
+#             self.down = conv1x1(in_planes, mid, 1, mode=mode, bias=True)
+#             self.nonlin = nn.ReLU()
+#             self.up = conv1x1(mid, planes, 1, mode=mode, bias=True)
+
+#     def _prepare_fft_mask(self, H, W, device):
+#         # 如果已有且尺寸相同则复用
+#         if getattr(self, "mask_low", None) is not None and self.mask_low.shape[-2:] == (H, W):
+#             return
+        
+#         cutoff = int(min(H, W) * self.cutoff_ratio // 2)
+#         cx, cy = H // 2, W // 2
+
+#         mask_low = torch.zeros(1, 1, H, W, device=device)
+#         if cutoff > 0:
+#             mask_low[:, :, cx-cutoff:cx+cutoff, cy-cutoff:cy+cutoff] = 1
+#         else:
+#             # 如果 cutoff==0 则全部为高频（mask_low �?），仍合�?#             pass
+#         mask_high = 1 - mask_low
+
+#         # 存为 buffer 以避免每�?alloc
+#         # 注意 register_buffer 已经�?__init__ 中预留了属�?#         self.mask_low = mask_low
+#         self.mask_high = mask_high
+
+#     @torch.no_grad()
+#     def decompose_fft(self, x):
+#         # --- fast FFT: downsample first ---
+#         if self.fft_down > 1:
+#             # 平均池化降分辨率以节�?FFT 计算
+#             x_small = F.avg_pool2d(x, self.fft_down)
+#         else:
+#             x_small = x
+
+#         B, C, H, W = x_small.shape
+
+#         self._prepare_fft_mask(H, W, x.device)
+
+#         # FFT 与频�?shift
+#         fft = torch.fft.fft2(x_small, norm='ortho')
+#         fft_shift = torch.fft.fftshift(fft, dim=(-2, -1))
+
+#         # 使用缓存�?mask（会自动 broadcast �?batch & channels�?#         fft_low = fft_shift * self.mask_low
+#         fft_high = fft_shift * self.mask_high
+
+#         low = torch.fft.ifft2(torch.fft.ifftshift(fft_low, dim=(-2, -1)), norm='ortho').real
+#         high = torch.fft.ifft2(torch.fft.ifftshift(fft_high, dim=(-2, -1)), norm='ortho').real
+
+#         # upsample 回原始分辨率（若做了降采样）
+#         if self.fft_down > 1:
+#             low = F.interpolate(low, size=x.shape[-2:], mode="bilinear", align_corners=False)
+#             high = F.interpolate(high, size=x.shape[-2:], mode="bilinear", align_corners=False)
+
+#         return low, high
+
+#     def forward(self, x):
+#         if self.layer_idx in self.fft_blocks:
+
+#             # ------------ FFT ---------------
+#             low, high = self.decompose_fft(x)
+
+#             # ------------ merged down proj ---------------
+#             # merged shape: B x (3*C) x H x W
+#             merged = torch.cat([x, low, high], dim=1)           # B x (3C) x H x W
+#             merged = self.down(merged)                          # B x (3*mid) x H x W
+#             merged = self.nonlin(merged)
+#             merged = self.up(merged)                            # B x (3*planes) x H x W
+
+#             # 拆回三路
+#             delta1, delta2, delta3 = torch.chunk(merged, 3, dim=1)
+
+#             # ------------ fast router ---------------
+#             router_in = x.mean((2, 3))                          # B x C (in_planes)
+#             router_w = torch.softmax(self.router(router_in), -1)
+
+#             w1 = router_w[:, 0].view(-1, 1, 1, 1)
+#             w2 = router_w[:, 1].view(-1, 1, 1, 1)
+#             w3 = router_w[:, 2].view(-1, 1, 1, 1)
+
+#             out = delta1 * w1 + delta2 * w2 + delta3 * w3
+
+#         else:
+#             out = self.up(self.nonlin(self.down(x)))
+
+#         return out * self.scalar.to(out.device)
+
+
+    
+class Adapter(nn.Module):
+    def __init__(self, in_planes, planes, r=32, mode='parallel'):
+        super(Adapter, self).__init__()
+        self.down_proj = conv1x1(in_planes, in_planes // r, 1, mode=mode, bias=True)
+        self.non_linear_func = nn.ReLU()
+        self.up_proj = conv1x1(in_planes // r, planes, 1, mode=mode, bias=True)
+        nn.init.kaiming_uniform_(self.down_proj.conv.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.up_proj.conv.weight)
+        nn.init.zeros_(self.down_proj.conv.bias)
+        nn.init.zeros_(self.up_proj.conv.bias)
+    def forward(self, x):
+        return self.up_proj(self.non_linear_func(self.down_proj(x)))
+
+
+class conv_task(nn.Module):
+    def __init__(self, in_planes, planes, adapter=None, kernel=3, stride=1, padding=0, nb_tasks=20, is_proj=1, second=0, norm=None, th=0.9, r=32, lora_alpha=16, scalar=None):
+        super(conv_task, self).__init__()
+        self.is_proj = is_proj
+        self.second = second
+        self.conv = conv1x1_fonc(in_planes, planes, stride) if kernel == 1 else conv(in_planes, planes, kernel=kernel, stride=stride, padding=padding)
+        self.mode = adapter
+        self.scalar_type = scalar
+        self.scalar = nn.Parameter(torch.ones(1)) if scalar == 'learnable_scalar' else torch.ones(1)
+        if self.mode == 'series' and is_proj:
+            self.norm = nn.ModuleList([nn.Sequential(conv1x1(planes, mode=self.mode), nn.BatchNorm2d(planes)) for i in range(nb_tasks)])
+        elif self.mode == 'parallel' and is_proj:
+            if kernel == 1:
+                self.down_proj = conv1x1(in_planes, planes // r, stride, mode=self.mode, bias=True)
+                self.non_linear_func = nn.ReLU()
+                self.up_proj = conv1x1(planes // r, planes, stride, mode=self.mode, bias=True)
+                self.adapter_norm = nn.BatchNorm2d(planes)
+                nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
+                nn.init.zeros_(self.up_proj.weight)
+                nn.init.zeros_(self.down_proj.bias)
+                nn.init.zeros_(self.up_proj.bias)
+            else:
+                self.down_proj = conv(in_planes, planes // r, kernel=kernel, stride=stride, padding=padding, bias=True)
+                self.non_linear_func = nn.ReLU()
+                self.up_proj = conv(planes // r, planes, kernel=(1, 1), stride=(1, 1), padding=0, bias=True)
+                self.adapter_norm = nn.BatchNorm2d(planes)
+                nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
+                nn.init.zeros_(self.up_proj.weight)
+                nn.init.zeros_(self.down_proj.bias)
+                nn.init.zeros_(self.up_proj.bias)
+
+            self.norm = nn.BatchNorm2d(planes) if norm is None else norm
+            self.mean_feats = torch.zeros((1, in_planes))        # out_planes or in_planes
+            self.num_feats = torch.zeros(nb_tasks)
+            self.threshold = th
+        elif self.mode == 'ssf' and is_proj:
+            self.scale = nn.Parameter(torch.ones(planes))
+            self.shift = nn.Parameter(torch.zeros(planes))
+            self.norm = nn.BatchNorm2d(planes) if norm is None else norm
+        elif self.mode == 'lora' and is_proj:
+            self.lora_A = nn.Parameter(torch.zeros(in_planes, r))
+            self.lora_B = nn.Parameter(torch.zeros(r, planes))
+            self.r = r
+            self.lora_alpha = lora_alpha
+            self.scaling = self.lora_alpha / self.r
+            nn.init.normal_(self.lora_A)
+            nn.init.zeros_(self.lora_B)
+            self.norm = nn.BatchNorm2d(planes) if norm is None else norm
+            self.mean_feats = torch.zeros((nb_tasks, planes))        # out_planes or in_planes
+            self.num_feats = torch.zeros(nb_tasks)
+            self.threshold = th
+        else:
+            self.norm = nn.ModuleList([nn.BatchNorm2d(planes) for i in range(nb_tasks)])
+        # FrozenBatchNorm2d.convert_frozen_batchnorm(self)
+
+    def forward(self, x):
+        y = self.norm(self.conv(x))
+        if self.mode == 'parallel' and self.is_proj:
+            #adapt_x = self.adapter_norm(self.up_proj(self.non_linear_func(self.down_proj(x))))
+            adapt_x = self.up_proj(self.non_linear_func(self.down_proj(x)))
+            if self.scalar == 'cosine_sim':
+                _x = x.mean(dim=[0, 2, 3]).detach()
+                cos_sim = F.cosine_similarity(self.mean_feats.to(_x.device), _x.unsqueeze(0), dim=1)
+                y = y + adapt_x * cos_sim
+                self.mean_feats = 0.9 * self.mean_feats.to(_x.device) + 0.1 * _x[None, :]
+            else:
+                y = y + adapt_x * self.scalar.to(y.device)
+        elif self.mode == 'ssf' and self.is_proj:
+            y = y * self.scale[None, :, None, None] + self.shift[None, :, None, None]
+        elif self.mode == 'lora' and self.is_proj:
+            b, c, h, w = x.shape
+            y = y + (x.permute(0, 2, 3, 1).reshape(-1, c) @ self.lora_A @ self.lora_B).reshape(b, h, w, -1).permute(0, 3, 1, 2) * self.scaling
+
+        #y = self.norm(y)
+
+        return y
+
+
+class BasicBlock(CNNBlockBase):
+    """
+    The basic residual block for ResNet-18 and ResNet-34 defined in :paper:`ResNet`,
+    with two 3x3 conv layers and a projection shortcut if needed.
+    """
+
+    def __init__(self, in_channels, out_channels, *, stride=1, norm="BN"):
+        """
+        Args:
+            in_channels (int): Number of input channels.
+            out_channels (int): Number of output channels.
+            stride (int): Stride for the first conv.
+            norm (str or callable): normalization for all conv layers.
+                See :func:`layers.get_norm` for supported format.
+        """
+        super().__init__(in_channels, out_channels, stride)
+
+        if in_channels != out_channels:
+            self.shortcut = Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=1,
+                stride=stride,
+                bias=False,
+                norm=get_norm(norm, out_channels),
+            )
+        else:
+            self.shortcut = None
+
+        self.conv1 = Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False,
+            norm=get_norm(norm, out_channels),
+        )
+
+        self.conv2 = Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+            norm=get_norm(norm, out_channels),
+        )
+
+        for layer in [self.conv1, self.conv2, self.shortcut]:
+            if layer is not None:  # shortcut can be None
+                weight_init.c2_msra_fill(layer)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = F.relu_(out)
+        out = self.conv2(out)
+
+        if self.shortcut is not None:
+            shortcut = self.shortcut(x)
+        else:
+            shortcut = x
+
+        out += shortcut
+        out = F.relu_(out)
+        return out
+
+
+
+class BottleneckBlock(CNNBlockBase):
+    """
+    The standard bottleneck residual block used by ResNet-50, 101 and 152
+    defined in :paper:`ResNet`.  It contains 3 conv layers with kernels
+    1x1, 3x3, 1x1, and a projection shortcut if needed.
+    """
+ 
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        *,
+        bottleneck_channels,
+        stride=1,
+        num_groups=1,
+        norm="BN",
+        stride_in_1x1=False,
+        dilation=1,
+        adapter=None,
+        out_batch_norm=False,
+        out_batch_resolution=32,
+        adapter_ratio=32,
+        layer_idx=0,  # 层索�?        fft_blocks=None,  # FFT blocks配置
+        SPECTRAL_ADAPTER_config=None,  # SpectralAdapter专用配置
+    ):
+        """
+        Args:
+            bottleneck_channels (int): number of output channels for the 3x3
+                "bottleneck" conv layers.
+            num_groups (int): number of groups for the 3x3 conv layer.
+            norm (str or callable): normalization for all conv layers.
+                See :func:`layers.get_norm` for supported format.
+            stride_in_1x1 (bool): when stride>1, whether to put stride in the
+                first 1x1 convolution or the bottleneck 3x3 convolution.
+            dilation (int): the dilation rate of the 3x3 conv layer.
+        """
+        self.layer_idx = layer_idx
+        super().__init__(in_channels, out_channels, stride)
+        if in_channels != out_channels:
+            self.shortcut = Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=1,
+                stride=stride,
+                bias=False,
+                norm=get_norm(norm, out_channels),
+            )
+        else:
+            self.shortcut = None
+
+        # The original MSRA ResNet models have stride in the first 1x1 conv
+        # The subsequent fb.torch.resnet and Caffe2 ResNe[X]t implementations have
+        # stride in the 3x3 conv
+        stride_1x1, stride_3x3 = (stride, 1) if stride_in_1x1 else (1, stride)
+        self.conv1 = Conv2d(
+            in_channels,
+            bottleneck_channels,
+            kernel_size=1,
+            stride=stride_1x1,
+            bias=False,
+            norm=get_norm(norm, bottleneck_channels, out_batch_norm, out_batch_resolution),
+        )
+
+        self.conv2 = Conv2d(
+            bottleneck_channels,
+            bottleneck_channels,
+            kernel_size=3,
+            stride=stride_3x3,
+            padding=1 * dilation,
+            bias=False,
+            groups=num_groups,
+            dilation=dilation,
+            norm=get_norm(norm, bottleneck_channels, out_batch_norm, out_batch_resolution),
+        )
+
+        self.conv3 = Conv2d(
+            bottleneck_channels,
+            out_channels,
+            kernel_size=1,
+            bias=False,
+            norm=get_norm(norm, out_channels, out_batch_norm, out_batch_resolution),
+        )
+
+        if adapter is not None:
+            if adapter == "spectral" and (layer_idx in (fft_blocks or [])):
+                # 仅当当前层索引在 FFT blocks 中时启用 SpectralAdapter
+                self.adapter = SpectralAdapter(
+                    in_planes=bottleneck_channels,
+                    planes=out_channels,
+                    r=adapter_ratio,
+                    layer_idx=layer_idx,
+                    fft_blocks=fft_blocks,
+                    cutoff_ratio=SPECTRAL_ADAPTER_config.CUTOFF_RATIO,
+                    scalar_type=SPECTRAL_ADAPTER_config.SCALAR,
+                    dropout=SPECTRAL_ADAPTER_config.DROPOUT,
+                    mode="parallel"
+                )
+                self.has_adapter = True
+            elif adapter == "parallel":
+                self.adapter = Adapter(bottleneck_channels, out_channels, r=adapter_ratio)
+                self.has_adapter = True
+            else:
+                # self.adapter = nn.Identity()
+                self.has_adapter = False
+        else:
+            # self.adapter = nn.Identity()
+            self.has_adapter = False
+
+
+        init_layers = [self.conv1, self.conv2, self.conv3, self.shortcut] #if adapter is not None else [self.conv1, self.conv2, self.conv3, self.shortcut]
+        for layer in init_layers:
+            if layer is not None:  # shortcut can be None
+                weight_init.c2_msra_fill(layer)
+
+        # Zero-initialize the last normalization in each residual branch,
+        # so that at the beginning, the residual branch starts with zeros,
+        # and each residual block behaves like an identity.
+        # See Sec 5.1 in "Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour":
+        # "For BN layers, the learnable scaling coefficient γ is initialized
+        # to be 1, except for each residual block's last BN
+        # where γ is initialized to be 0."
+
+        # nn.init.constant_(self.conv3.norm.weight, 0)
+        # TODO this somehow hurts performance when training GN models from scratch.
+        # Add it as an option when we need to use this code to train a backbone.
+
+    def forward(self, x):
+        if isinstance(x, tuple):
+            x, g1, g2 = x
+        # out, f1, f2 = self.conv1(x)
+        out = self.conv1(x)
+        out = F.relu_(out)
+        out_tmp = self.conv2(out)
+        out = F.relu_(out_tmp)
+
+        out = self.conv3(out)
+
+        if self.shortcut is not None:
+            shortcut = self.shortcut(x)
+        else:
+            shortcut = x
+
+        # out += shortcut
+        out = out + shortcut if not self.has_adapter else out + shortcut + self.adapter(out_tmp)
+        out = F.relu_(out)
+        # return (out, g1 + [f1], g2 + [f2])
+        # #随机恢复
+        # if True:
+        #     # for nm, m in self.model.named_modules():#模块名称nm和模块实例m
+        #         for npp, p in self.adapter.named_parameters():#参数名称npp和对应参数张量p
+        #             if npp in ['down_proj.conv.weight', 'up_proj.conv.weight'] and p.requires_grad:  # 筛选出对应参数名且参与梯度计算
+        #                 mask1 = (torch.rand(p.shape) < 0.1).float().cuda()# 生成随机掩码，根据概率决定是否恢复参�?        #                 with torch.no_grad():
+        #                     p.data = self.adapter.npp * mask1 + p * (1. - mask1)
+        #             elif npp in [ 'down_proj.conv.bias','up_proj.conv.bias'] and p.requires_grad:
+        #                 mask2 = (torch.rand(p.shape) < 0.1).float().cuda()  # 生成随机掩码，根据概率决定是否恢复参�?        #                 with torch.no_grad():
+        #                     p.data = self.adapter.npp * mask2 + p * (1. - mask2)
+        return out
+
+
+class DeformBottleneckBlock(CNNBlockBase):
+    """
+    Similar to :class:`BottleneckBlock`, but with :paper:`deformable conv <deformconv>`
+    in the 3x3 convolution.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        *,
+        bottleneck_channels,
+        stride=1,
+        num_groups=1,
+        norm="BN",
+        stride_in_1x1=False,
+        dilation=1,
+        deform_modulated=False,
+        deform_num_groups=1,
+    ):
+        super().__init__(in_channels, out_channels, stride)
+        self.deform_modulated = deform_modulated
+
+        if in_channels != out_channels:
+            self.shortcut = Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=1,
+                stride=stride,
+                bias=False,
+                norm=get_norm(norm, out_channels),
+            )
+        else:
+            self.shortcut = None
+
+        stride_1x1, stride_3x3 = (stride, 1) if stride_in_1x1 else (1, stride)
+
+        self.conv1 = Conv2d(
+            in_channels,
+            bottleneck_channels,
+            kernel_size=1,
+            stride=stride_1x1,
+            bias=False,
+            norm=get_norm(norm, bottleneck_channels),
+        )
+
+        if deform_modulated:
+            deform_conv_op = ModulatedDeformConv
+            # offset channels are 2 or 3 (if with modulated) * kernel_size * kernel_size
+            offset_channels = 27
+        else:
+            deform_conv_op = DeformConv
+            offset_channels = 18
+
+        self.conv2_offset = Conv2d(
+            bottleneck_channels,
+            offset_channels * deform_num_groups,
+            kernel_size=3,
+            stride=stride_3x3,
+            padding=1 * dilation,
+            dilation=dilation,
+        )
+        self.conv2 = deform_conv_op(
+            bottleneck_channels,
+            bottleneck_channels,
+            kernel_size=3,
+            stride=stride_3x3,
+            padding=1 * dilation,
+            bias=False,
+            groups=num_groups,
+            dilation=dilation,
+            deformable_groups=deform_num_groups,
+            norm=get_norm(norm, bottleneck_channels),
+        )
+
+        self.conv3 = Conv2d(
+            bottleneck_channels,
+            out_channels,
+            kernel_size=1,
+            bias=False,
+            norm=get_norm(norm, out_channels),
+        )
+
+        for layer in [self.conv1, self.conv2, self.conv3, self.shortcut]:
+            if layer is not None:  # shortcut can be None
+                weight_init.c2_msra_fill(layer)
+
+        nn.init.constant_(self.conv2_offset.weight, 0)
+        nn.init.constant_(self.conv2_offset.bias, 0)
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = F.relu_(out)
+
+        if self.deform_modulated:
+            offset_mask = self.conv2_offset(out)
+            offset_x, offset_y, mask = torch.chunk(offset_mask, 3, dim=1)
+            offset = torch.cat((offset_x, offset_y), dim=1)
+            mask = mask.sigmoid()
+            out = self.conv2(out, offset, mask)
+        else:
+            offset = self.conv2_offset(out)
+            out = self.conv2(out, offset)
+        out = F.relu_(out)
+
+        out = self.conv3(out)
+
+        if self.shortcut is not None:
+            shortcut = self.shortcut(x)
+        else:
+            shortcut = x
+
+        out += shortcut
+        out = F.relu_(out)
+        return out
+
+
+class BasicStem(CNNBlockBase):
+    """
+    The standard ResNet stem (layers before the first residual block),
+    with a conv, relu and max_pool.
+    """
+
+    def __init__(self, in_channels=3, out_channels=64, norm="BN"):
+        """
+        Args:
+            norm (str or callable): norm after the first conv layer.
+                See :func:`layers.get_norm` for supported format.
+        """
+        super().__init__(in_channels, out_channels, 4)
+        self.in_channels = in_channels
+        self.conv1 = Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=7,
+            stride=2,
+            padding=3,
+            bias=False,
+            norm=get_norm(norm, out_channels),
+        )
+        weight_init.c2_msra_fill(self.conv1)
+
+    def forward(self, x):
+        # x, f1, f2 = self.conv1(x)
+        x = self.conv1(x)
+        x = F.relu_(x)
+        x = F.max_pool2d(x, kernel_size=3, stride=2, padding=1)
+        # return (x, [f1], [f2])
+        return x
+
+
+class ResNet(Backbone):
+    """
+    Implement :paper:`ResNet`.
+    """
+
+    def __init__(self, stem, stages, num_classes=None, out_features=None, freeze_at=0, fft_blocks=None, SPECTRAL_ADAPTER_config=None):
+        """
+        Args:
+            stem (nn.Module): a stem module
+            stages (list[list[CNNBlockBase]]): several (typically 4) stages,
+                each contains multiple :class:`CNNBlockBase`.
+            num_classes (None or int): if None, will not perform classification.
+                Otherwise, will create a linear layer.
+            out_features (list[str]): name of the layers whose outputs should
+                be returned in forward. Can be anything in "stem", "linear", or "res2" ...
+                If None, will return the output of the last layer.
+            freeze_at (int): The number of stages at the beginning to freeze.
+                see :meth:`freeze` for detailed explanation.
+        """
+        super().__init__()
+        self.stem = stem
+        self.num_classes = num_classes
+
+        current_stride = self.stem.stride
+        self._out_feature_strides = {"stem": current_stride}
+        self._out_feature_channels = {"stem": self.stem.out_channels}
+
+        self.stage_names, self.stages = [], []
+        self.fft_blocks = fft_blocks if fft_blocks is not None else []
+        self.SPECTRAL_ADAPTER_config = SPECTRAL_ADAPTER_config
+        # print("+++++++++++",freeze_at) #冻结参数
+        
+        global_block_idx = 0
+        
+        if out_features is not None:
+            # Avoid keeping unused layers in this module. They consume extra memory
+            # and may cause allreduce to fail
+            num_stages = max(
+                [{"res2": 1, "res3": 2, "res4": 3, "res5": 4}.get(f, 0) for f in out_features]
+            )
+            stages = stages[:num_stages]
+        for i, blocks in enumerate(stages):
+            assert len(blocks) > 0, len(blocks)
+            for block in blocks:
+                assert isinstance(block, CNNBlockBase), block
+
+            name = "res" + str(i + 2)
+            stage = nn.Sequential(*blocks)
+            
+            # 为这个stage中的所有block设置layer_idx
+            for j, block in enumerate(stage):
+                if hasattr(block, 'layer_idx'):
+                    block.layer_idx = global_block_idx
+                    # print(block)
+                    # print(block.layer_idx)
+                    global_block_idx += 1
+                    
+            self.add_module(name, stage)
+            self.stage_names.append(name)
+            self.stages.append(stage)
+
+            self._out_feature_strides[name] = current_stride = int(
+                current_stride * np.prod([k.stride for k in blocks])
+            )
+            self._out_feature_channels[name] = curr_channels = blocks[-1].out_channels
+        self.stage_names = tuple(self.stage_names)  # Make it static for scripting
+
+        if num_classes is not None:
+            self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+            self.linear = nn.Linear(curr_channels, num_classes)
+
+            # Sec 5.1 in "Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour":
+            # "The 1000-way fully-connected layer is initialized by
+            # drawing weights from a zero-mean Gaussian with standard deviation of 0.01."
+            nn.init.normal_(self.linear.weight, std=0.01)
+            name = "linear"
+
+        if out_features is None:
+            out_features = [name]
+        self._out_features = out_features
+        assert len(self._out_features)
+        children = [x[0] for x in self.named_children()]
+        for out_feature in self._out_features:
+            assert out_feature in children, "Available children: {}".format(", ".join(children))
+        freeze_at = 5
+        self.freeze(freeze_at)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor of shape (N,C,H,W). H, W must be a multiple of ``self.size_divisibility``.
+
+        Returns:
+            dict[str->Tensor]: names and the corresponding features
+        """
+        assert x.dim() == 4, f"ResNet takes an input of shape (N, C, H, W). Got {x.shape} instead!"
+        outputs = {}
+        x = self.stem(x)
+        if "stem" in self._out_features:
+            outputs["stem"] = x
+        for name, stage in zip(self.stage_names, self.stages):
+            x = stage(x)
+            if name in self._out_features:
+                outputs[name] = x
+        if self.num_classes is not None:
+            x = self.avgpool(x)
+            x = torch.flatten(x, 1)
+            x = self.linear(x)
+            if "linear" in self._out_features:
+                outputs["linear"] = x
+        return outputs
+
+    def output_shape(self):
+        return {
+            name: ShapeSpec(
+                channels=self._out_feature_channels[name], stride=self._out_feature_strides[name]
+            )
+            for name in self._out_features
+        }
+
+    def freeze(self, freeze_at=0):
+        """
+        Freeze the first several stages of the ResNet. Commonly used in
+        fine-tuning.
+
+        Layers that produce the same feature map spatial size are defined as one
+        "stage" by :paper:`FPN`.
+
+        Args:
+            freeze_at (int): number of stages to freeze.
+                `1` means freezing the stem. `2` means freezing the stem and
+                one residual stage, etc.
+
+        Returns:
+            nn.Module: this ResNet itself
+        """
+        if freeze_at >= 1:
+            self.stem.freeze()
+        for idx, stage in enumerate(self.stages, start=2):
+            if freeze_at >= idx:
+                for block in stage.children():
+                    block.freeze()
+        return self
+
+    @staticmethod
+    def make_stage(block_class, num_blocks, *, in_channels, out_channels, start_layer_idx=0, **kwargs):
+        """
+        Create a list of blocks of the same type that forms one ResNet stage.
+
+        Args:
+            block_class (type): a subclass of CNNBlockBase that's used to create all blocks in this
+                stage. A module of this type must not change spatial resolution of inputs unless its
+                stride != 1.
+            num_blocks (int): number of blocks in this stage
+            in_channels (int): input channels of the entire stage.
+            out_channels (int): output channels of **every block** in the stage.
+            kwargs: other arguments passed to the constructor of
+                `block_class`. If the argument name is "xx_per_block", the
+                argument is a list of values to be passed to each block in the
+                stage. Otherwise, the same argument is passed to every block
+                in the stage.
+
+        Returns:
+            list[CNNBlockBase]: a list of block module.
+
+        Examples:
+        ::
+            stage = ResNet.make_stage(
+                BottleneckBlock, 3, in_channels=16, out_channels=64,
+                bottleneck_channels=16, num_groups=1,
+                stride_per_block=[2, 1, 1],
+                dilations_per_block=[1, 1, 2]
+            )
+
+        Usually, layers that produce the same feature map spatial size are defined as one
+        "stage" (in :paper:`FPN`). Under such definition, ``stride_per_block[1:]`` should
+        all be 1.
+        """
+        blocks = []
+        for i in range(num_blocks):
+            curr_kwargs = {}
+            for k, v in kwargs.items():
+                if k.endswith("_per_block"):
+                    assert len(v) == num_blocks, (
+                        f"Argument '{k}' of make_stage should have the "
+                        f"same length as num_blocks={num_blocks}."
+                    )
+                    newk = k[: -len("_per_block")]
+                    assert newk not in kwargs, f"Cannot call make_stage with both {k} and {newk}!"
+                    curr_kwargs[newk] = v[i]
+                else:
+                    curr_kwargs[k] = v
+                    
+            # 为每个block分配唯一的layer_idx
+            curr_kwargs["layer_idx"] = start_layer_idx + i
+
+            blocks.append(
+                block_class(in_channels=in_channels, out_channels=out_channels, **curr_kwargs)
+            )
+            in_channels = out_channels
+        return blocks
+
+    @staticmethod
+    def make_default_stages(depth, block_class=None, **kwargs):
+        """
+        Created list of ResNet stages from pre-defined depth (one of 18, 34, 50, 101, 152).
+        If it doesn't create the ResNet variant you need, please use :meth:`make_stage`
+        instead for fine-grained customization.
+
+        Args:
+            depth (int): depth of ResNet
+            block_class (type): the CNN block class. Has to accept
+                `bottleneck_channels` argument for depth > 50.
+                By default it is BasicBlock or BottleneckBlock, based on the
+                depth.
+            kwargs:
+                other arguments to pass to `make_stage`. Should not contain
+                stride and channels, as they are predefined for each depth.
+
+        Returns:
+            list[list[CNNBlockBase]]: modules in all stages; see arguments of
+                :class:`ResNet.__init__`.
+        """
+        num_blocks_per_stage = {
+            18: [2, 2, 2, 2],
+            34: [3, 4, 6, 3],
+            50: [3, 4, 6, 3],
+            101: [3, 4, 23, 3],
+            152: [3, 8, 36, 3],
+        }[depth]
+        if block_class is None:
+            block_class = BasicBlock if depth < 50 else BottleneckBlock
+        if depth < 50:
+            in_channels = [64, 64, 128, 256]
+            out_channels = [64, 128, 256, 512]
+        else:
+            in_channels = [64, 256, 512, 1024]
+            out_channels = [256, 512, 1024, 2048]
+        ret = []
+        for (n, s, i, o) in zip(num_blocks_per_stage, [1, 2, 2, 2], in_channels, out_channels):
+            if depth >= 50:
+                kwargs["bottleneck_channels"] = o // 4
+            ret.append(
+                ResNet.make_stage(
+                    block_class=block_class,
+                    num_blocks=n,
+                    stride_per_block=[s] + [1] * (n - 1),
+                    in_channels=i,
+                    out_channels=o,
+                    **kwargs,
+                )
+            )
+        return ret
+
+    def add_adapter(self, adapter="parallel", th=0.9, scalar=None, r=32):
+        # add adapter in stem
+        # new_conv1 = conv_task(self.stem.conv1.in_channels, self.stem.conv1.out_channels, adapter=adapter,
+        #                       kernel=self.stem.conv1.kernel_size, stride=self.stem.conv1.stride, padding=self.stem.conv1.padding,
+        #                       norm=self.stem.conv1.norm, th=0.5, nb_tasks=100)
+        # new_conv1.conv.load_state_dict({'weight': self.stem.conv1.state_dict()['weight']})
+        # self.stem.conv1 = new_conv1
+        for stage in self.stages:
+            for idx, block in enumerate(stage):
+                if idx >= 0 and block.conv1.stride[0] == 1:
+                    new_conv1 = conv_task(block.conv1.in_channels, block.conv1.out_channels, adapter=adapter, kernel=block.conv1.kernel_size, stride=block.conv1.stride,
+                                   norm=block.conv1.norm, th=th, scalar=scalar, r=r)
+                    load_weight = {k: block.conv1.state_dict()[k] for k in block.conv1.state_dict() if k in new_conv1.conv.state_dict()}
+                    new_conv1.conv.load_state_dict(load_weight)
+                    block.conv1 = new_conv1
+                # block.conv1
+        # self.conv1 = conv_task(in_channels, bottleneck_channels, adapter=adapter, kernel=1, stride=stride_1x1,
+        #                        norm=get_norm(norm, bottleneck_channels))
+
+
+ResNetBlockBase = CNNBlockBase
+"""
+Alias for backward compatibiltiy.
+"""
+
+
+def make_stage(*args, **kwargs):
+    """
+    Deprecated alias for backward compatibiltiy.
+    """
+    return ResNet.make_stage(*args, **kwargs)
+
+
+
+@BACKBONE_REGISTRY.register()
+def build_resnet_backbone(cfg, input_shape):
+    """
+    Create a ResNet instance from config.
+
+    Returns:
+        ResNet: a :class:`ResNet` instance.
+    """
+    # need registration of new blocks/stems?
+
+    norm = cfg.MODEL.RESNETS.NORM
+    stem = BasicStem(
+        in_channels=input_shape.channels,
+        out_channels=cfg.MODEL.RESNETS.STEM_OUT_CHANNELS,
+        norm=norm,
+    )
+
+    # fmt: off
+    freeze_at           = cfg.MODEL.BACKBONE.FREEZE_AT
+    out_features        = cfg.MODEL.RESNETS.OUT_FEATURES
+    depth               = cfg.MODEL.RESNETS.DEPTH
+    num_groups          = cfg.MODEL.RESNETS.NUM_GROUPS
+    width_per_group     = cfg.MODEL.RESNETS.WIDTH_PER_GROUP
+    bottleneck_channels = num_groups * width_per_group
+    in_channels         = cfg.MODEL.RESNETS.STEM_OUT_CHANNELS
+    out_channels        = cfg.MODEL.RESNETS.RES2_OUT_CHANNELS
+    stride_in_1x1       = cfg.MODEL.RESNETS.STRIDE_IN_1X1
+    res5_dilation       = cfg.MODEL.RESNETS.RES5_DILATION
+    deform_on_per_stage = cfg.MODEL.RESNETS.DEFORM_ON_PER_STAGE
+    deform_modulated    = cfg.MODEL.RESNETS.DEFORM_MODULATED
+    deform_num_groups   = cfg.MODEL.RESNETS.DEFORM_NUM_GROUPS
+    out_batch_norm      = cfg.TEST.COLLECT_FEATURES or cfg.TEST.ADAPTATION.GLOBAL_ALIGN == "bn_stats"
+    adapter             = cfg.TEST.ADAPTER.TYPE if cfg.TEST.ADAPTATION.WHERE == 'adapter' else None
+    adapter_ratio       = cfg.TEST.ADAPTER.HIDDEN_RATIO
+    # fmt: on
+    assert res5_dilation in {1, 2}, "res5_dilation cannot be {}.".format(res5_dilation)
+
+    num_blocks_per_stage = {
+        18: [2, 2, 2, 2],
+        34: [3, 4, 6, 3],
+        50: [3, 4, 6, 3],
+        101: [3, 4, 23, 3],
+        152: [3, 8, 36, 3],
+    }[depth]
+
+    if depth in [18, 34]:
+        assert out_channels == 64, "Must set MODEL.RESNETS.RES2_OUT_CHANNELS = 64 for R18/R34"
+        assert not any(
+            deform_on_per_stage
+        ), "MODEL.RESNETS.DEFORM_ON_PER_STAGE unsupported for R18/R34"
+        assert res5_dilation == 1, "Must set MODEL.RESNETS.RES5_DILATION = 1 for R18/R34"
+        assert num_groups == 1, "Must set MODEL.RESNETS.NUM_GROUPS = 1 for R18/R34"
+    # 获取SpectralAdapter配置
+    fft_blocks = getattr(cfg.TEST.ADAPTER.SPECTRAL_ADAPTER, "FFT_BLOCKS", []) if hasattr(cfg.TEST, 'ADAPTER') and hasattr(cfg.TEST.ADAPTER, 'SPECTRAL_ADAPTER') else []
+    SPECTRAL_ADAPTER_config = getattr(cfg.TEST.ADAPTER, "SPECTRAL_ADAPTER", None) if hasattr(cfg.TEST, 'ADAPTER') else None
+    
+    # 创建SPECTRAL_ADAPTER_config字典或对�?    SPECTRAL_ADAPTER_config = CN() if hasattr(cfg.TEST, 'ADAPTER') and hasattr(cfg.TEST.ADAPTER, 'SPECTRAL_ADAPTER') else None
+    if SPECTRAL_ADAPTER_config is not None:
+        SPECTRAL_ADAPTER_config.CUTOFF_RATIO = getattr(cfg.TEST.ADAPTER.SPECTRAL_ADAPTER, "CUTOFF_RATIO", 0.3)
+        SPECTRAL_ADAPTER_config.SCALAR = getattr(cfg.TEST.ADAPTER, "constant", "learnable_scalar")
+        SPECTRAL_ADAPTER_config.DROPOUT = getattr(cfg.TEST.ADAPTER, "DROPOUT", 0.0)
+    
+    
+    # 构建stages时传递fft_blocks和earth_adapter_config
+
+    stages = []
+    global_block_idx = 0  # 全局block索引
+
+    for idx, stage_idx in enumerate(range(2, 6)):
+        # res5_dilation is used this way as a convention in R-FCN & Deformable Conv paper
+        dilation = res5_dilation if stage_idx == 5 else 1
+        first_stride = 1 if idx == 0 or (stage_idx == 5 and dilation == 2) else 2
+        stage_kargs = {
+            "num_blocks": num_blocks_per_stage[idx],
+            "stride_per_block": [first_stride] + [1] * (num_blocks_per_stage[idx] - 1),
+            "in_channels": in_channels,
+            "out_channels": out_channels,
+            "norm": norm,
+            "out_batch_norm": out_batch_norm,
+            "out_batch_resolution": 2 ** (8 - idx),
+            "adapter": adapter,
+            "adapter_ratio": adapter_ratio,
+            "fft_blocks": fft_blocks,  # 传递FFT blocks配置
+            "SPECTRAL_ADAPTER_config": SPECTRAL_ADAPTER_config,  # 传递EarthAdapter配置
+        }
+        # Use BasicBlock for R18 and R34.
+        if depth in [18, 34]:
+            stage_kargs["block_class"] = BasicBlock
+        else:
+            stage_kargs["bottleneck_channels"] = bottleneck_channels
+            stage_kargs["stride_in_1x1"] = stride_in_1x1
+            stage_kargs["dilation"] = dilation
+            stage_kargs["num_groups"] = num_groups
+            if deform_on_per_stage[idx]:
+                stage_kargs["block_class"] = DeformBottleneckBlock
+                stage_kargs["deform_modulated"] = deform_modulated
+                stage_kargs["deform_num_groups"] = deform_num_groups
+            else:
+                stage_kargs["block_class"] = BottleneckBlock
+        blocks = ResNet.make_stage(start_layer_idx=global_block_idx, **stage_kargs)
+        global_block_idx += num_blocks_per_stage[idx]
+        in_channels = out_channels
+        out_channels *= 2
+        bottleneck_channels *= 2
+        stages.append(blocks)
+    return ResNet(stem, stages, out_features=out_features, freeze_at=freeze_at, fft_blocks=fft_blocks, SPECTRAL_ADAPTER_config=SPECTRAL_ADAPTER_config)
