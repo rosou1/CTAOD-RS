@@ -83,6 +83,74 @@ pip install -r requirements.txt
 - Download the DIOR-C at the |[Baidu Cloud](https://pan.baidu.com/s/1g01ATN473z3kfr73w88R-A?pwd=rwvf)|
 - Download the source features statistics of DIOR at the |[Baidu Cloud](https://pan.baidu.com/s/1pMDURPX_tfUDo1G-T8xLsw?pwd=sv8n)|
 ---
+## 🔧 Quick Start / How to Run
+
+### 1. Collect Source Feature Statistics
+
+Before running test-time adaptation, you need to collect feature statistics from the source domain (DIOR-clean). These statistics capture the source feature distribution (mean and covariance) used for KL divergence alignment during adaptation.
+
+```bash
+# ResNet50 backbone
+python tools/train_net.py \
+    --config-file configs/Base/COCO_faster_rcnn_R50_FPN_1x.yaml \
+    --eval-only \
+    MODEL.WEIGHTS /path/to/r50_weights.pth \
+    TEST.CONTINUAL_DOMAIN False \
+    TEST.COLLECT_FEATURES True \
+    OUTPUT_DIR outputs/stats/r50
+
+# SwinT backbone
+python tools/train_net.py \
+    --config-file configs/Base/COCO_faster_rcnn_swinT_FPN_1x.yaml \
+    --eval-only \
+    MODEL.WEIGHTS /path/to/swt_weights.pth \
+    TEST.CONTINUAL_DOMAIN False \
+    TEST.COLLECT_FEATURES True \
+    OUTPUT_DIR outputs/stats/swt
+```
+
+### 2. Run Test-Time Adaptation
+
+**SpectralAdapter (Frequency-Domain Routing):**
+
+```bash
+# ResNet50 backbone
+python tools/train_net.py \
+    --config-file configs/TTA/COCO_FFTR50.yaml \
+    --eval-only \
+    TEST.ADAPTATION.WHERE adapter \
+    OUTPUT_DIR outputs/tta/fftr50
+
+# SwinT backbone
+python tools/train_net.py \
+    --config-file configs/TTA/COCO_FFTswinT.yaml \
+    --eval-only \
+    TEST.ADAPTATION.WHERE adapter \
+    OUTPUT_DIR outputs/tta/fftswt
+```
+
+**SpectralAdapter + Historical Reconstruction (VAE-based):**
+
+```bash
+# ResNet50 backbone
+python tools/train_net.py \
+    --config-file configs/TTA/COCO_R50recon.yaml \
+    --eval-only \
+    TEST.ADAPTATION.WHERE adapter \
+    OUTPUT_DIR outputs/tta/r50recon
+
+# SwinT backbone
+python tools/train_net.py \
+    --config-file configs/TTA/COCO_swinTrecon.yaml \
+    --eval-only \
+    TEST.ADAPTATION.WHERE adapter \
+    OUTPUT_DIR outputs/tta/swtrecon
+```
+
+### 3. (Optional) Enable WandB Logging
+
+Add `--wandb` to any command above to log metrics to Weights & Biases.
+---
 ## 📝 License
 
 - This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
