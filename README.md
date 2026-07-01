@@ -1,4 +1,4 @@
-<p align="center">
+﻿<p align="center">
   <h1 align="center">
     Continual Test-Time Adaptation for Remote Sensing Object Detection
   </h1>
@@ -159,3 +159,16 @@ Add `--wandb` to any command above to log metrics to Weights & Biases.
 
 - Our work is inspired by WHW(https://github.com/natureyoo/ContinualTTA_ObjectDetection) and Earth-Adapter(https://github.com/VisionXLab/Earth-Adapter). We are grateful for their outstanding work and code.
 ---
+## 📚 Citation
+
+If you find this work helpful in your research, please consider citing:
+
+```bibtex
+@article{yong2026continual,
+  title={Continual Test-Time Adaptive Object Detection in Remote Sensing Images via Spectral Routing and Historical Reconstruction},
+  author={Yong, Mingjing and Liu, Nanqing and Lei, Sen and Pan, Jie and Yang, Xue and Li, Heng-Chao},
+  journal={IEEE Transactions on Circuits and Systems for Video Technology},
+  year={2026},
+  publisher={IEEE}
+}
+```
