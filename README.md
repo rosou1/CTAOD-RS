@@ -31,7 +31,7 @@
 Official PyTorch implementation of  **Continual Test-Time Adaptation for Remote Sensing Object Detection**
 
 <div align="center">
-  <img src="overview.jpg" width="100%"/>
+  <img src="overview.png" width="100%"/>
 </div>
 
 
